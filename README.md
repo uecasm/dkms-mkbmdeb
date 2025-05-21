@@ -20,7 +20,7 @@ An uninstaller isn't provided but you can just read the script and delete the fi
 
 Basically the same as before, just replace `dkms mkbmdeb` with `[/path/to/]dkms-mkbmdeb`.
 
-See the manpage for more usage detail and some examples: `man [/path/to/]dkms-mkbmdeb` (path required if not installed).
+See the manpage for more usage detail and some examples: `man [/path/to/]dkms-mkbmdeb.8` (path required if not installed).
 
 Note that currently the `--all` option is not supported; either specify the desired kernel versions explicitly or let it default to your current version.
 
