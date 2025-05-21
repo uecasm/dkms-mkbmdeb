@@ -1,0 +1,211 @@
+#!/bin/bash
+
+readonly mv_re='^([^/]*)/(.*)$'
+
+parse_kernelarch(){
+    if [[ $1 =~ $mv_re ]]; then
+        kernelver[${#kernelver[@]}]="${BASH_REMATCH[1]}"
+        arch[${#arch[@]}]="${BASH_REMATCH[2]}"
+    else
+        kernelver[${#kernelver[@]}]="$1"
+    fi
+}
+
+parse_moduleversion(){
+    if [[ $1 =~ $mv_re ]]; then
+        module="${BASH_REMATCH[1]}"
+        module_version="${BASH_REMATCH[2]}"
+    else
+        module="$1"
+    fi
+}
+
+fatal(){
+    for line in "$@"; do echo >&2 "$line"; done
+    exit 1
+}
+
+mktemp_or_die(){
+    local t
+    t=$(mktemp "$@") && echo "$t" && return
+    [[ $* = *-d* ]] && fatal "Unable to make temporary directory"
+    fatal "Unable to make temporary file."
+}
+
+preproc_file(){
+    local date_str="$(date -R)"
+    echo "modifying $1..."
+    sed -e "s/DEBIAN_PACKAGE/$debian_package/g" \
+	-e "s/DEBIAN_BUILD_ARCH/$debian_build_arch/g" \
+	-e "s/KERNEL_VERSION/$kernelver/g" \
+        -e "s/MODULE_NAME/$module/g" \
+        -e "s/MODULE_VERSION/$module_version/g" \
+        -e "s/DATE_STAMP/$date_str/" \
+        -i "$1"
+}
+
+build_deb(){
+    local kernelver="$1" arch="$2"
+    local debian_package=${module//_/-}
+    local debian_build_arch=$(dpkg-architecture -qDEB_BUILD_ARCH)
+    local desc="$module/$module_version in $kernelver/$arch"
+    
+    local system_mk="$dkms_tree/$module/$module_version/source/$module-dkms-mkbmdeb"
+    local local_mk="/etc/dkms/template-dkms-mkbmdeb"
+    local dev_mk="$(dirname "$(realpath "$0")")/template"
+    local template=""
+    if [ -d "$system_mk" ]; then template="$system_mk"
+    elif [ -d "$local_mk" ]; then template="$local_mk"
+    elif [ -d "$dev_mk" ]; then template="$dev_mk"
+    else fatal "Couldn't find $local_mk"
+    fi
+    
+    local temp_dir=$(mktemp_or_die --tmpdir -d dkms-mkbmdeb.XXXXXX)
+    trap "rm -rf \"$temp_dir\"" EXIT
+    
+    cp -ar "$template/" "$temp_dir/mkbmdeb" || fatal "Failed to copy template for $desc"
+    pushd "$temp_dir/mkbmdeb" >/dev/null 2>&1
+    for file in debian/*; do
+        preproc_file "$file"
+        chmod 755 "$file"
+    done
+    
+    echo "Building DKMS tarball for $desc..."
+    $dkms mktarball --binaries-only \
+            -m $module/$module_version -k $kernelver/$arch \
+            --archive=./$module-$module_version.dkms.tar.gz \
+            || fatal "Failed to generate DKMS tarball for $desc"
+    		
+    echo "Building binary package for $desc..."
+    export KVER="$kernelver" KARCH="$arch"
+    dpkg-buildpackage -rfakeroot -d -b -us -uc || fatal "Error building package for $desc"
+
+    cp -vf ../*.deb "$output_dir/"
+    popd >/dev/null 2>&1
+    
+    rm -rf "$temp_dir"
+    trap "" EXIT
+}
+
+printhelp(){
+    echo "$0 [options] [modulename/version]"
+    echo "  -m|--module    name/version    OR  -m name -v version"
+    echo "  -k|--kernelver version/arch    OR  -k version -a arch  ..."
+    echo "  -o|--output    path"
+    echo "  --dkms         path"
+    echo "  --dkmstree     path"
+}
+
+# Check dependencies
+if ! which fakeroot dh dpkg-buildpackage >/dev/null; then
+    fatal "One or more of fakeroot, debhelper, or dpkg-dev is missing."
+fi
+
+# Parse arguments
+declare -a kernelver=() arch=()
+module=""
+module_version=""
+output_dir="."
+dkms="/usr/sbin/dkms"
+dkms_tree="/var/lib/dkms"
+
+if ! args=$(getopt -n "$(basename "$0")" \
+        -o "hm:v:k:a:o:" \
+        -l "help,module:,kernelver:,arch:,dkms:,dkmstree:,output:" \
+        -- "$@"); then
+    printhelp
+    exit 1
+fi
+eval set -- "$args"
+while true; do
+    case "$1" in
+        -h|--help)
+            printhelp
+            exit 0
+            ;;
+        -m|--module)
+            parse_moduleversion "$2"
+            shift 2
+            ;;
+        -v)
+            module_version="$2"
+            shift 2
+            ;;
+        -k|--kernelver)
+            parse_kernelarch "$2"
+            shift 2
+            ;;
+        -a|--arch)
+            arch[${#arch[@]}]="$2"
+            shift 2
+            ;;
+        -o|--output)
+            output_dir="$2"
+            shift 2
+            ;;
+        --dkms)
+            dkms="$2"
+            shift 2
+            ;;
+        --dkmstree)
+            dkms_tree="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            fatal "Script error: option $1 not handled"
+            ;;
+    esac
+done
+if [ $# -gt 0 ] && [ -z "$module" ]; then
+    parse_moduleversion "$1"
+    shift
+fi
+if [ $# -ne 0 ]; then
+    printhelp
+    exit 1
+fi
+
+# Sanity checking
+
+# Error if # of arches doesn't match # of kernels
+if (( ${#kernelver[@]} != ${#arch[@]} && ${#arch[@]} > 1 )); then
+    fatal $" If more than one arch is specified on the command line, then there" \
+        $"must be an equal number of kernel versions also specified (1:1 relationship)."
+fi
+
+# Check that a module is specified
+if [[ ! $module || ! $module_version ]]; then
+    fatal "Arguments <module> and <module-version> are not specified." \
+          "Usage: $0 <module>/<module-version> or" \
+          "       $0 -m <module>/<module-version> or" \
+          "       $0 -m <module> -v <module-version>"
+fi
+
+# Check output directory
+output_dir=$(realpath "$output_dir")
+if [ ! -d "$output_dir" ]; then
+    fatal "Output directory $output_dir does not exist."
+fi
+
+# Fill out kernel versions; TODO support --all
+if [[ ! $kernelver ]]; then
+    kernelver[0]=$(uname -r)
+fi
+if [[ ! $arch ]]; then
+    arch[0]=$(uname -m)
+fi
+if ((${#arch[@]} == 1 && ${#kernelver[@]} > 1)); then
+    while ((${#arch[@]} < ${#kernelver[@]})); do
+        arch[${#arch[@]}]=$arch
+    done
+fi
+
+# Build packages
+for k in "${!kernelver[@]}"; do
+    build_deb "${kernelver[k]}" "${arch[k]}"
+done
+
